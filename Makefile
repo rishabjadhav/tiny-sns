@@ -28,7 +28,7 @@ HOST_SYSTEM = $(shell uname | cut -f 1 -d_)
 SYSTEM ?= $(HOST_SYSTEM)
 CXX = g++
 CPPFLAGS += `pkg-config --cflags protobuf grpc`
-CXXFLAGS += -std=c++17 -DGLOG_USE_GLOG_EXPORT
+CXXFLAGS += -std=c++17 -DGLOG_USE_GLOG_EXPORT -I/usr/include/zookeeper
 
 ifeq ($(SYSTEM),Darwin)
 LDFLAGS += `pkg-config --libs protobuf grpc++`\
@@ -41,7 +41,8 @@ LDFLAGS += `pkg-config --libs protobuf grpc++`\
            $(PROTOBUF_UTF8_RANGE_LINK_LIBS) \
            -pthread\
            -Wl,--no-as-needed -lgrpc++_reflection -Wl,--as-needed\
-           -ldl -lglog
+           -ldl -lglog\
+		   -lzookeeper_mt
 endif
 PROTOC = protoc
 GRPC_CPP_PLUGIN = grpc_cpp_plugin
@@ -53,6 +54,7 @@ PROTOS_PATH = .
 vpath %.proto $(PROTOS_PATH)
 
 all: system-check tsd tsc
+	mkdir -p logs
 
 tsc: client.o sns.pb.o sns.grpc.pb.o tsc.o
 	$(CXX) $^ $(LDFLAGS) -g -o $@
@@ -71,6 +73,7 @@ tsd: sns.pb.o sns.grpc.pb.o tsd.o
 
 clean:
 	rm -f *~ *.o *.pb.cc *.pb.h tsc tsd
+	rm -rf logs
 
 
 # The following is to test your system and ensure a smoother experience.

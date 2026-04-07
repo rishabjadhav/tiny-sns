@@ -33,6 +33,13 @@
 #include <grpc++/grpc++.h>
 #include <glog/logging.h>
 #include <mutex>
+
+#include <sys/stat.h>
+
+#define THREADED
+#include <zookeeper/zookeeper.h>
+#include <zookeeper/zookeeper_log.h>
+
 #define log(severity, msg) LOG(severity) << msg; google::FlushLogFiles(google::severity); 
 
 #include "sns.grpc.pb.h"
@@ -53,6 +60,96 @@ using csce_dsc::Request;
 using csce_dsc::Reply;
 using csce_dsc::SNSService;
 
+// global zk handle kept alive for the duration of the server process, persists through session lifespan
+static zhandle_t* g_zh = nullptr;
+ 
+void zk_watcher(zhandle_t* zh, int type, int state,
+                const char* path, void* ctx) {
+    if (state == ZOO_EXPIRED_SESSION_STATE) {
+        log(ERROR, "ZooKeeper: session expired - ephemeral zNode has been removed");
+    } else if (state == ZOO_CONNECTED_STATE && type == ZOO_SESSION_EVENT) {
+        log(INFO, "ZooKeeper: session (re)connected");
+    }
+    (void)zh; (void)path; (void)ctx;
+}
+ 
+// register this server with ZooKeeper by creating an ephemeral zNode
+void registerWithZooKeeper(const std::string& zk_addr,
+                           const std::string& cluster_id,
+                           const std::string& server_id,
+                           const std::string& host,
+                           const std::string& port) {
+    g_zh = zookeeper_init(zk_addr.c_str(), zk_watcher,
+                          /*recv_timeout_ms=*/5000,
+                          /*clientid=*/0, /*ctx=*/nullptr, /*flags=*/0);
+    if (!g_zh) {
+        log(ERROR, "ZooKeeper: failed to create handle - server will NOT be "
+            "visible to clients");
+        return;
+    }
+ 
+    int waited = 0;
+    while (zoo_state(g_zh) != ZOO_CONNECTED_STATE && waited < 5000) {
+        usleep(100000);
+        waited += 100;
+    }
+    if (zoo_state(g_zh) != ZOO_CONNECTED_STATE) {
+        log(ERROR, "ZooKeeper: timed out connecting to " + zk_addr);
+        zookeeper_close(g_zh);
+        g_zh = nullptr;
+        return;
+    }
+    log(INFO, "ZooKeeper: connected to " + zk_addr);
+ 
+    // Ensure parent path /services exists (persistent)
+    int rc = zoo_create(g_zh, "/services", nullptr, -1,
+                        &ZOO_OPEN_ACL_UNSAFE, 0, nullptr, 0);
+    if (rc != ZOK && rc != ZNODEEXISTS) {
+        log(ERROR, "ZooKeeper: could not create /services rc=" + std::to_string(rc));
+    }
+ 
+    // Ensure /services/TinySNS-service exists (persistent)
+    rc = zoo_create(g_zh, "/services/TinySNS-service", nullptr, -1,
+                    &ZOO_OPEN_ACL_UNSAFE, 0, nullptr, 0);
+    if (rc != ZOK && rc != ZNODEEXISTS) {
+        log(ERROR, "ZooKeeper: could not create /services/TinySNS-service rc=" +
+            std::to_string(rc));
+    }
+ 
+    // Create the ephemeral zNode for this server instance.
+    // Node name: cluster_id + "_" + server_id  (e.g. "1_1", "2_1", "3_1")
+    std::string node_path = "/services/TinySNS-service/" +
+                            cluster_id + "_" + server_id;
+ 
+    // Data the client will read: "host:port"
+    std::string node_data = host + ":" + port;
+ 
+    // ZOO_EPHEMERAL ensures automatic deletion when the session closes.
+    char created_path[256];
+    rc = zoo_create(g_zh, node_path.c_str(),
+                    node_data.c_str(), (int)node_data.size(),
+                    &ZOO_OPEN_ACL_UNSAFE, ZOO_EPHEMERAL,
+                    created_path, sizeof(created_path));
+ 
+    if (rc == ZOK) {
+        log(INFO, "ZooKeeper: registered ephemeral zNode at " +
+            std::string(created_path) + " data=" + node_data);
+    } else if (rc == ZNODEEXISTS) {
+        // A previous run may have left a stale node if the session didn't
+        // expire cleanly. Overwrite its data.
+        rc = zoo_set(g_zh, node_path.c_str(),
+                     node_data.c_str(), (int)node_data.size(), -1);
+        if (rc == ZOK) {
+            log(INFO, "ZooKeeper: updated existing zNode at " + node_path +
+                " data=" + node_data);
+        } else {
+            log(ERROR, "ZooKeeper: zoo_set failed rc=" + std::to_string(rc));
+        }
+    } else {
+        log(ERROR, "ZooKeeper: zoo_create failed for " + node_path +
+            " rc=" + std::to_string(rc));
+    }
+}
 
 struct Client {
   std::string username;
@@ -70,445 +167,300 @@ struct Client {
   time_t last_disconnect_time = 0;
 };
 
-//Vector that stores every client that has been created
+
+// vector that stores every client that has been created
 std::vector<Client*> client_db;
 
 // mutex added for heartbeat Ctrl-C logic
 std::mutex client_db_mu;
 
-class SNSServiceImpl final : public SNSService::Service {
 
-    // getClient helper function
+// returns the directory name for this server's persistent storage, holding all timeline/relation files
+static std::string g_server_dir;
+ 
+std::string serverFile(const std::string& filename) {
+    return g_server_dir + "/" + filename;
+}
+
+class SNSServiceImpl final : public SNSService::Service {
+ 
     Client* getClient(const std::string& username) {
         for (Client* c : client_db) {
-            if (c->username == username) {
-                return c;
-            }
+            if (c->username == username) return c;
         }
         return nullptr;
     }
-
-    // helper function to read last N messages from a file
+ 
     std::vector<Message> getLastNMessages(const std::string& filename, int n) {
         std::vector<Message> messages;
         std::ifstream file(filename);
-    
-        if (!file.is_open()) {
-            return messages;
-        }
-    
+        if (!file.is_open()) return messages;
+ 
         std::vector<std::string> all_lines;
         std::string line;
-
-        while (std::getline(file, line)) {
-            all_lines.push_back(line);
-        }
+        while (std::getline(file, line)) all_lines.push_back(line);
         file.close();
-    
-        // parse messages from the end
-        // format: T <timestamp>\nU <username>\nW <msg>\n<empty line>
+ 
         std::vector<Message> all_messages;
-    
         for (size_t i = 0; i < all_lines.size(); ) {
-            if (i < all_lines.size() && all_lines[i].length() > 0 && all_lines[i][0] == 'T' && i + 2 < all_lines.size()) {
+            if (i < all_lines.size() &&
+                all_lines[i].length() > 0 && all_lines[i][0] == 'T' &&
+                i + 2 < all_lines.size()) {
+ 
                 Message msg;
-        
-                // parse timestamp (line starting with 'T ')
                 std::string timestamp_str = all_lines[i].substr(2);
                 struct tm tm = {};
                 strptime(timestamp_str.c_str(), "%Y-%m-%d %H:%M:%S", &tm);
                 time_t t = mktime(&tm);
-                google::protobuf::Timestamp* timestamp = new google::protobuf::Timestamp();
-                timestamp->set_seconds(t);
-                timestamp->set_nanos(0);
-                msg.set_allocated_timestamp(timestamp);
-            
-                // parse username (line starting with 'U ')
-                if (i + 1 < all_lines.size() && all_lines[i + 1].length() > 0 && all_lines[i + 1][0] == 'U') {
-                    std::string username = all_lines[i + 1].substr(2);  // Skip "U "
-                    msg.set_username(username);
-                }
-            
-                // parse message content (line starting with 'W ')
-                if (i + 2 < all_lines.size() && all_lines[i + 2].length() > 0 && all_lines[i + 2][0] == 'W') {
-                    std::string content = all_lines[i + 2].substr(2);  // Skip "W "
-                    msg.set_msg(content);
-                }
-            
+                google::protobuf::Timestamp* ts = new google::protobuf::Timestamp();
+                ts->set_seconds(t);
+                ts->set_nanos(0);
+                msg.set_allocated_timestamp(ts);
+ 
+                if (i + 1 < all_lines.size() && all_lines[i+1].length() > 0 &&
+                    all_lines[i+1][0] == 'U')
+                    msg.set_username(all_lines[i+1].substr(2));
+ 
+                if (i + 2 < all_lines.size() && all_lines[i+2].length() > 0 &&
+                    all_lines[i+2][0] == 'W')
+                    msg.set_msg(all_lines[i+2].substr(2));
+ 
                 all_messages.push_back(msg);
-                i += 4;  // Skip T, U, W, and empty line
+                i += 4;
             } else {
                 i++;
             }
         }
-        
-        // get last N messages
+ 
         int start_idx = std::max(0, (int)all_messages.size() - n);
-        for (size_t i = start_idx; i < all_messages.size(); i++) {
+        for (size_t i = start_idx; i < all_messages.size(); i++)
             messages.push_back(all_messages[i]);
-        }
-        
+ 
         return messages;
     }
-
-    // helper function to write message to file
+ 
     void writeMessageToFile(const std::string& filename, const Message& msg) {
-        std::ofstream file(filename, std::ios::app);  // Append mode
-        
+        std::ofstream file(filename, std::ios::app);
         if (!file.is_open()) {
             log(ERROR, "Failed to open file: " + filename);
             return;
         }
-    
-        // format timestamp
         time_t time = msg.timestamp().seconds();
         struct tm* tm = localtime(&time);
         char time_buf[64];
         strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm);
-        
-        // write in required format
         file << "T " << time_buf << "\n";
         file << "U " << msg.username() << "\n";
         file << "W " << msg.msg() << "\n";
-        file << "\n";  // Empty line separator
-        
+        file << "\n";
         file.close();
     }
-
-        void saveFollowingToFile(Client* user) {
-            std::string filename = user->username + "_relations.txt";
-            std::ofstream file(filename, std::ios::trunc);
-
-            if (!file.is_open()) {
-                log(ERROR, "Failed to open relations file for writing");
-                return;
-            }
-
-            for (Client* following : user->client_following) {
-                file << following->username << "\n";
-            }
-
-            file.close();
+ 
+    void saveFollowingToFile(Client* user) {
+        std::string filename = serverFile(user->username + "_relations.txt");
+        std::ofstream file(filename, std::ios::trunc);
+        if (!file.is_open()) {
+            log(ERROR, "Failed to open relations file for writing");
+            return;
         }
-
-        void loadFollowingFromFile(Client* user) {
-            std::string filename = user->username + "_relations.txt";
-            std::ifstream file(filename);
-
-            if (!file.is_open()) return;
-
-            std::string line;
-            while (std::getline(file, line)) {
-                Client* followed = getClient(line);
-                if (followed != nullptr) {
-                    user->client_following.push_back(followed);
-                    followed->client_followers.push_back(user);
-                }
-            }
-
-            file.close();
+        for (Client* following : user->client_following)
+            file << following->username << "\n";
+        file.close();
     }
-
-
+ 
+    void loadFollowingFromFile(Client* user) {
+        std::string filename = serverFile(user->username + "_relations.txt");
+        std::ifstream file(filename);
+        if (!file.is_open()) return;
+        std::string line;
+        while (std::getline(file, line)) {
+            Client* followed = getClient(line);
+            if (followed != nullptr) {
+                user->client_following.push_back(followed);
+                followed->client_followers.push_back(user);
+            }
+        }
+        file.close();
+    }
+ 
 public:
-  
-
-    /*
-    * List(): The List() function is called by the client via stub. It returns lists of all users and all those following the requesting user.
-    *
-    * The function receives a Request, which holds the user's name. This username identifies the user so we know whose following list to return.
-    * We add all users to list_reply, along with all users who follow the requesting user.
-    *
-    */
-    Status List(ServerContext* context, const Request* request, ListReply* list_reply) override {
+ 
+    Status List(ServerContext* context, const Request* request,
+                ListReply* list_reply) override {
         Client* user = nullptr;
-
-        // find requesting client via username provided in Request object
         for (Client* c : client_db) {
-            if (c->username == request->username()) {
-                user = c;
-                break;
-            }
+            if (c->username == request->username()) { user = c; break; }
         }
-
-        // add all users to list_reply
-        for (Client* c : client_db) {
+        for (Client* c : client_db)
             list_reply->add_all_users(c->username);
-        }
-
-        // add followers of this user to list_reply
-        if (user != nullptr) {
-            for (Client* follower : user->client_followers) {
+        if (user != nullptr)
+            for (Client* follower : user->client_followers)
                 list_reply->add_followers(follower->username);
-            }
-        }
+        log(INFO, "List called by " + request->username());
         return Status::OK;
     }
-
-    /*
-    * Follow(): The Follow() function is called by the client via stub. It identifies both the requesting user and the follower, then adds users
-    * to eachother's following list.
-    *
-    * The function identifies the requesting user by Request.username and the requested follower by the first argument provided.
-    * Then, both requesting user and requested follower are searched for in client_db. Then it checks if requesting user is already
-    * following the requested follower. If not, we add the requested follower to the requested user's following list, and the requested
-    * user to the requested follower's followers list.
-    *
-    */
-    Status Follow(ServerContext* context, const Request* request, Reply* reply) override {
+ 
+    Status Follow(ServerContext* context, const Request* request,
+                  Reply* reply) override {
         std::string u1 = request->username();
         std::string u2 = request->arguments(0);
-
         Client* c1 = nullptr;
         Client* c2 = nullptr;
-
         for (Client* c : client_db) {
             if (c->username == u1) c1 = c;
             if (c->username == u2) c2 = c;
         }
-
-        if (u1 == u2) {
-            reply->set_msg("Follow failed -- Can't follow yourself");
-            return Status::OK;
-        }
-
-        if (c1 == nullptr) {
-            reply->set_msg("Follow Failed -- Requesting user not found");
-            return Status::OK;
-        }
-
-        if (c2 == nullptr) {
-            reply->set_msg("Follow Failed -- Invalid Username");
-            return Status::OK;
-        }
-
-        // check if already following
+        if (u1 == u2) { reply->set_msg("Follow failed -- Can't follow yourself"); return Status::OK; }
+        if (c1 == nullptr) { reply->set_msg("Follow Failed -- Requesting user not found"); return Status::OK; }
+        if (c2 == nullptr) { reply->set_msg("Follow Failed -- Invalid Username"); return Status::OK; }
         for (Client* following : c1->client_following) {
             if (following->username == u2) {
                 reply->set_msg("you have already joined");
                 return Status::OK;
             }
         }
-
-        // add c2 to c1's following
-        // add c1 to c2's followers
         c1->client_following.push_back(c2);
         c2->client_followers.push_back(c1);
         saveFollowingToFile(c1);
-
-
+        log(INFO, u1 + " followed " + u2);
         reply->set_msg("Follow Successful");
-
-        return Status::OK; 
+        return Status::OK;
     }
-
-    /*
-    * UnFollow(): The UnFollow() function is called by the client via stub. It identifies both the requesting user and the follower, then removes users
-    * from eachother's respective lists.
-    *
-    * The function identifies the requesting user by Request.username and the requested follower by the first argument provided.
-    * Then, both requesting user and requested follower are searched for in client_db. We search through the requesting user's following to find the
-    * requested follower to unfollow. If not found, then just return. If found, remove from following. Then search through requested to unfollow's followers,
-    * removing the user if found.
-    *
-    */
-    Status UnFollow(ServerContext* context, const Request* request, Reply* reply) override {
+ 
+    Status UnFollow(ServerContext* context, const Request* request,
+                    Reply* reply) override {
         std::string u1 = request->username();
         std::string u2 = request->arguments(0);
-
         Client* c1 = nullptr;
         Client* c2 = nullptr;
-
         for (Client* c : client_db) {
             if (c->username == u1) c1 = c;
             if (c->username == u2) c2 = c;
         }
-
-        if (c1 == nullptr) {
-            reply->set_msg("Follow Failed -- Requesting user not found");
-            return Status::OK;
-        }
-
-        if (c2 == nullptr) {
-            reply->set_msg("UnFollow Failed -- Invalid Username");
-            return Status::OK;
-        }
-
-        // search through requesting user's following, if not found, return
+        if (c1 == nullptr) { reply->set_msg("Follow Failed -- Requesting user not found"); return Status::OK; }
+        if (c2 == nullptr) { reply->set_msg("UnFollow Failed -- Invalid Username"); return Status::OK; }
         auto it1 = std::find(c1->client_following.begin(), c1->client_following.end(), c2);
         if (it1 == c1->client_following.end()) {
             reply->set_msg("You are not a follower");
             return Status::OK;
         }
-
-        // remove requested to unfollow from requesting user's following
         c1->client_following.erase(it1);
-        
-        // search through requested to unfollow's followers
         auto it2 = std::find(c2->client_followers.begin(), c2->client_followers.end(), c1);
-        if (it2 != c2->client_followers.end()) {
-            // remove requested user from requested to unfollow's followers
-            c2->client_followers.erase(it2);
-        }
-
+        if (it2 != c2->client_followers.end()) c2->client_followers.erase(it2);
         saveFollowingToFile(c1);
+        log(INFO, u1 + " unfollowed " + u2);
         reply->set_msg("UnFollow Successful");
         return Status::OK;
     }
-
-    /*
-    * Connect(): Handles a client trying to connect to server.
-    *
-    * First the function checks if the requesting user is already connected.
-    * If not, we create a new Client, populating the username and adding to client_db.
-    * If already connected and we had a recent heartbeat, or client has some other status, set as connected and return.
-    *
-    */
-    Status Connect(ServerContext* context, const Request* request, Reply* reply) override {
-      std::lock_guard<std::mutex> lk(client_db_mu);
-
-      Client* c = getClient(request->username());
-      time_t now = time(NULL);
-      const time_t HEARTBEAT_TIMEOUT = 2;
-      const time_t GRACE_PERIOD = 2;
-
-      if (c == nullptr) {
-        c = new Client();
-        c->username = request->username();
+ 
+    Status Connect(ServerContext* context, const Request* request,
+                   Reply* reply) override {
+        std::lock_guard<std::mutex> lk(client_db_mu);
+        Client* c = getClient(request->username());
+        time_t now = time(NULL);
+        const time_t HEARTBEAT_TIMEOUT = 2;
+        const time_t GRACE_PERIOD = 2;
+ 
+        if (c == nullptr) {
+            c = new Client();
+            c->username = request->username();
+            c->connected = true;
+            c->last_heartbeat = now;
+            c->last_disconnect_time = 0;
+            client_db.push_back(c);
+            loadFollowingFromFile(c);
+            log(INFO, "New client connected: " + request->username());
+            reply->set_msg("Connection Successful");
+            return Status::OK;
+        }
+ 
+        bool session_alive = c->connected && ((now - c->last_heartbeat) < HEARTBEAT_TIMEOUT);
+        if (session_alive) {
+            reply->set_msg("you are already connected");
+            return Status(grpc::StatusCode::ALREADY_EXISTS, "Already connected");
+        }
+ 
+        if (c->last_disconnect_time != 0 && now < c->last_disconnect_time + GRACE_PERIOD)
+            return Status(grpc::StatusCode::UNAVAILABLE, "Grace period not elapsed");
+ 
         c->connected = true;
         c->last_heartbeat = now;
         c->last_disconnect_time = 0;
-        client_db.push_back(c);
-        loadFollowingFromFile(c);
+        log(INFO, "Client reconnected: " + request->username());
         reply->set_msg("Connection Successful");
         return Status::OK;
-      }
-
-      bool session_alive = c->connected && ((now - c->last_heartbeat) < HEARTBEAT_TIMEOUT);
-      if (session_alive) {
-        reply->set_msg("you are already connected");
-        return Status(grpc::StatusCode::ALREADY_EXISTS, "Already connected");
-      }
-
-      if (c->last_disconnect_time != 0 && now < c->last_disconnect_time + GRACE_PERIOD) {
-        return Status(grpc::StatusCode::UNAVAILABLE, "Grace period not elapsed");
-      }
-
-      c->connected = true;
-      c->last_heartbeat = now;
-      c->last_disconnect_time = 0;
-      reply->set_msg("Connection Successful");
-      return Status::OK;
     }
-
-    /*
-    * Timeline(): Handles a continuous connection with one or more clients. This function runs as long as the client keeps the stream open.
-    *
-    * First, we continuously read from the stream sent by the client. The stream allows us to Read() from client, and Write() to client.
-    * We read from stream until client DCs or stream breaks. Each iteration is one message from client.
-    *
-    * If it's the first message we are sending, don't treat it like a real message and use it to initialize user. If not, get message and
-    * forward to all user's followers, writing to persistence files and logging.
-    *   
-    */
-    Status Timeline(ServerContext* context, ServerReaderWriter<Message, Message>* stream) override {
-
+ 
+    Status Timeline(ServerContext* context,
+                    ServerReaderWriter<Message, Message>* stream) override {
         Message message;
         Client* user = nullptr;
         bool initialized = false;
         std::string timeline_username;
-
+ 
         while (stream->Read(&message)) {
-
             std::string username = message.username();
-
+ 
             if (!initialized) {
                 initialized = true;
-                timeline_username = message.username();
-
+                timeline_username = username;
                 user = getClient(username);
                 if (user == nullptr) {
-                    log(ERROR, "Timeline: User not found: " + username);
+                    log(ERROR, "Timeline: user not found: " + username);
                     return Status(grpc::StatusCode::NOT_FOUND, "User not found");
                 }
-
                 user->stream = stream;
                 user->connected = true;
-
-                // send last 20 messages
-                std::string inbox_file = username + "_following.txt";
-                std::vector<Message> last_messages =
-                    getLastNMessages(inbox_file, 20);
-
-                for (const Message& m : last_messages) {
-                    stream->Write(m);
-                }
-
-                log(INFO, "Timeline: " + username + " initialized");
-
+ 
+                // Send last 20 messages from the user's inbox (following file)
+                std::string inbox_file = serverFile(username + "_following.txt");
+                std::vector<Message> last_messages = getLastNMessages(inbox_file, 20);
+                for (const Message& m : last_messages) stream->Write(m);
+ 
+                log(INFO, "Timeline initialized for " + username);
                 continue;
             }
-
+ 
             if (user == nullptr) {
-                user->last_heartbeat = time(NULL);
-                log(ERROR, "Timeline: User null during post");
+                log(ERROR, "Timeline: user null during post");
                 continue;
             }
-
-            // write to user's own timeline file
-            std::string own_file = user->username + ".txt";
+ 
+            // Write to user's own timeline file
+            std::string own_file = serverFile(user->username + ".txt");
             writeMessageToFile(own_file, message);
-
             log(INFO, user->username + " posted: " + message.msg());
-
-            // deliver message to followers
+ 
+            // Deliver to followers
             for (Client* follower : user->client_followers) {
-
                 if (follower == nullptr) continue;
-
-                // Write to follower inbox file
-                std::string inbox_file =
-                    follower->username + "_following.txt";
-
+                std::string inbox_file = serverFile(follower->username + "_following.txt");
                 writeMessageToFile(inbox_file, message);
-
-                if (follower->connected &&
-                    follower->stream != nullptr) {
-
+                if (follower->connected && follower->stream != nullptr)
                     follower->stream->Write(message);
-                }
             }
         }
-
-        if (user == nullptr && !timeline_username.empty()) {
+ 
+        if (user == nullptr && !timeline_username.empty())
             user = getClient(timeline_username);
-        }
         if (user != nullptr) {
             user->stream = nullptr;
             user->connected = false;
             user->last_disconnect_time = time(NULL);
-            log(INFO, user->username + " disconnected");
+            log(INFO, user->username + " disconnected from timeline");
         }
-
         return Status::OK;
     }
-
-    /*
-    * Heartbeat(): Heartbeat now sends the client it's last heartbeat time. This is used to enforce the 1 second reconnection condition.
-    *
-    * The function sets a lock giard, and sets the last heartbeat of the client to whenever it's called.
-    */
-    Status Heartbeat(ServerContext*, const Request* request, Reply* reply) override {
-      std::lock_guard<std::mutex> lk(client_db_mu);
-
-      Client* client = getClient(request->username());
-      if (!client) return Status(grpc::StatusCode::NOT_FOUND, "Client not found");
-
-      client->last_heartbeat = time(NULL);
-      client->connected = true;
-
-      reply->set_msg("Heartbeat acknowledged");
-      return Status::OK;
+ 
+    Status Heartbeat(ServerContext*, const Request* request,
+                     Reply* reply) override {
+        std::lock_guard<std::mutex> lk(client_db_mu);
+        Client* client = getClient(request->username());
+        if (!client) return Status(grpc::StatusCode::NOT_FOUND, "Client not found");
+        client->last_heartbeat = time(NULL);
+        client->connected = true;
+        reply->set_msg("Heartbeat acknowledged");
+        return Status::OK;
     }
 };
  
@@ -548,34 +500,45 @@ void RunServer(std::string port_no) {
 }
 
 int main(int argc, char** argv) {
-    if(argc != 2) {
-        std::cerr << "Invalid Command Line Arguments: Usage .\\tsd <config.ini>\n";
-        exit(0);
+    if (argc != 2) {
+        std::cerr << "Usage: ./tsd <config.ini>\n";
+        return 1;
     }
-
+ 
     mINI::INIFile file(argv[1]);
     mINI::INIStructure ini;
-
-    // read the config file
     file.read(ini);
-
-    // read configuration values
-    std::string&  port = ini["Server"]["PORT"];
-    std::string&  logLevel = ini["Glog"]["MIN_LOG_LEVEL"];
-    std::string&  logDir = ini["Glog"]["LOG_DIR"];
-
-    // Disable glog buffering for immediate output
+ 
+    std::string& port       = ini["Server"]["PORT"];
+    std::string& cluster_id = ini["Server"]["CLUSTER_ID"];
+    std::string& server_id  = ini["Server"]["SERVER_ID"];
+    std::string& host       = ini["Server"]["HOST"];
+    std::string& zk_addr    = ini["ZooKeeper"]["ADDRESS"];
+    std::string& logLevel   = ini["Glog"]["MIN_LOG_LEVEL"];
+    std::string& logDir     = ini["Glog"]["LOG_DIR"];
+ 
+    // Set up glog
     FLAGS_logbuflevel = -1;
     FLAGS_timestamp_in_logfile_name = 0;
-    
-    FLAGS_minloglevel = std::stoi(logLevel); 
+    FLAGS_minloglevel = std::stoi(logLevel);
     FLAGS_log_dir = logDir;
-
-    std::string log_file_name = std::string("server-") + port;
+ 
+    std::string log_file_name = "server-" + cluster_id + "-" + server_id;
     google::InitGoogleLogging(log_file_name.c_str());
-    log(INFO, "Logging Initialized. Server starting ...");
-
+    log(INFO, "Logging initialized. Server cluster=" + cluster_id +
+        " server=" + server_id + " port=" + port);
+ 
+    zoo_set_debug_level(ZOO_LOG_LEVEL_WARN);
+ 
+    g_server_dir = "server_" + cluster_id + "_" + server_id;
+    mkdir(g_server_dir.c_str(), 0755);
+    log(INFO, "Server storage directory: " + g_server_dir);
+ 
+    registerWithZooKeeper(zk_addr, cluster_id, server_id, host, port);
+ 
     RunServer(port);
-
+ 
+    if (g_zh) zookeeper_close(g_zh);
+ 
     return 0;
 }

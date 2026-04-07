@@ -29,8 +29,18 @@
 #include <chrono>
 #include <grpc++/grpc++.h>
 #include "client.h"
+#include <functional>
+#include <map>
 
 #include "sns.grpc.pb.h"
+
+#define THREADED
+#include <zookeeper/zookeeper.h>
+#include <sys/stat.h>
+
+#include <glog/logging.h>
+#define log(severity, msg) LOG(severity) << msg; google::FlushLogFiles(google::severity);
+
 using grpc::Channel;
 using grpc::ClientContext;
 using grpc::ClientReader;
@@ -58,14 +68,78 @@ Message MakeMessage(const std::string& username, const std::string& msg) {
     return m;
 }
 
+// watcher callback - required by zookeeper_init but we handle reconnection by re-querying on connect rather than watching continuously.
+void zk_watcher(zhandle_t* zh, int type, int state, const char* path, void* ctx) {
+    (void)zh;
+    (void)type;
+    (void)state;
+    (void)path;
+    (void)ctx;
+}
+ 
+// Returns map of cluster_id (1,2,3) -> "host:port"
+// Key is the numeric cluster ID parsed from the zNode name e.g. "1_1" -> 1
+std::map<int, std::string> getServerMap(const std::string& zk_addr) {
+    std::map<int, std::string> server_map;
+
+    zhandle_t* zh = zookeeper_init(zk_addr.c_str(), zk_watcher,
+                                   10000, 0, nullptr, 0);
+    if (!zh) {
+        log(ERROR, "ZooKeeper: failed to create handle for " + zk_addr);
+        return server_map;
+    }
+
+    int waited = 0;
+    while (zoo_state(zh) != ZOO_CONNECTED_STATE && waited < 5000) {
+        usleep(100000);
+        waited += 100;
+    }
+    if (zoo_state(zh) != ZOO_CONNECTED_STATE) {
+        log(ERROR, "ZooKeeper: timed out connecting to " + zk_addr);
+        zookeeper_close(zh);
+        return server_map;
+    }
+    log(INFO, "ZooKeeper: connected to " + zk_addr);
+
+    const char* parent = "/services/TinySNS-service";
+    String_vector children;
+    memset(&children, 0, sizeof(children));
+
+    int rc = zoo_get_children(zh, parent, 0, &children);
+    if (rc != ZOK) {
+        log(ERROR, "ZooKeeper: zoo_get_children failed rc=" + std::to_string(rc));
+        zookeeper_close(zh);
+        return server_map;
+    }
+
+    for (int i = 0; i < children.count; ++i) {
+        std::string node_name = children.data[i]; // e.g. "1_1", "2_1"
+
+        int cluster_id = std::stoi(node_name.substr(0, node_name.find('_')));
+
+        std::string child_path = std::string(parent) + "/" + node_name;
+        char buf[256];
+        int buf_len = sizeof(buf) - 1;
+        Stat stat;
+        rc = zoo_get(zh, child_path.c_str(), 0, buf, &buf_len, &stat);
+        if (rc == ZOK && buf_len > 0) {
+            buf[buf_len] = '\0';
+            server_map[cluster_id] = std::string(buf, buf_len);
+            log(INFO, "ZooKeeper: cluster " + std::to_string(cluster_id) +
+                " -> " + std::string(buf, buf_len));
+        }
+    }
+
+    deallocate_String_vector(&children);
+    zookeeper_close(zh);
+    return server_map;
+}
 
 class Client : public IClient
 {
 public:
-  Client(const std::string& hname,
-	 const std::string& uname,
-	 const std::string& p)
-    :hostname(hname), username(uname), port(p) {}
+    
+    Client(const std::string& zk_addr, const std::string& uname) : zk_address(zk_addr), username(uname) {}
 
 protected:
   virtual int    connectTo();
@@ -73,12 +147,11 @@ protected:
   virtual void   processTimeline();
 
 private:
-    std::string hostname;
+    std::string zk_address;
     std::string username;
-    std::string port;
+    std::string server_address;
   
-    // You can have an instance of the client stub
-    // as a member variable.
+    // client stub
     std::unique_ptr<SNSService::Stub> stub_;
     
     IReply Connect();
@@ -108,33 +181,50 @@ private:
     }
 };
 
-
-///////////////////////////////////////////////////////////
-//
-//////////////////////////////////////////////////////////
+/*
+ * connectTo(): The connectTo() function creates a gRPC stub for a server, selecting server based on client.
+ *
+ * The function first contacts zookeeper to get a list of all live servers, then selecting one using the hash(username).
+ * Then after selecting a server, a gRPC stub is created for the selected server.
+ */
 int Client::connectTo() {
-  // ------------------------------------------------------------
-  // In this function, you are supposed to create a stub so that
-  // you call service methods in the processCommand/porcessTimeline
-  // functions. That is, the stub should be accessible when you want
-  // to call any service methods in those functions.
-  // Please refer to gRpc tutorial how to create a stub.
-  // ------------------------------------------------------------
+    log(INFO, "Client: contacting ZooKeeper at " + zk_address);
+    std::map<int, std::string> server_map = getServerMap(zk_address);
 
-    // create gRPC channel and stub
-    std::string login_info = hostname + ":" + port;
-    stub_ = SNSService::NewStub(grpc::CreateChannel(login_info, grpc::InsecureChannelCredentials()));
+    if (server_map.empty()) {
+        log(ERROR, "Client: no servers available from ZooKeeper");
+        return -1;
+    }
 
-    // call connect RPC to register with server
+    int target = (int)(std::hash<std::string>{}(username) % 3);
+    int cluster_id = target + 1; // zNode names are 1-based
+
+    log(INFO, "Client: hash(" + username + ") % " +
+        std::to_string(3) + " = " + std::to_string(target) +
+        " -> cluster " + std::to_string(cluster_id));
+
+    auto it = server_map.find(cluster_id);
+    if (it == server_map.end()) {
+        log(ERROR, "Client: target cluster " + std::to_string(cluster_id) +
+            " is not available in ZooKeeper - cannot connect");
+        std::cerr << "Error: assigned server (cluster " << cluster_id
+                  << ") is not available. Please try again later.\n";
+        return -1;
+    }
+
+    server_address = it->second;
+    log(INFO, "Client: connecting to cluster " + std::to_string(cluster_id) +
+        " at " + server_address);
+
+    stub_ = SNSService::NewStub(
+        grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials()));
+
     IReply reply = Connect();
-
-    // if reply status is good and comm_status is successful, return 1
     if (reply.grpc_status.ok() && reply.comm_status == SUCCESS) {
         startHeartbeat();
         return 1;
-    } else {
-        return -1;
     }
+    return -1;
 }
 
 
@@ -334,75 +424,76 @@ IReply Client::Connect() {
  *
  */
 void Client::Timeline(const std::string& username) {
-
     ClientContext context;
+
+    // wait 10 seconds so stream fails if server down
+    context.set_deadline(std::chrono::system_clock::now() +
+                         std::chrono::seconds(10));
+
     auto stream = stub_->Timeline(&context);
 
+    // can establish stream? 
     Message init_msg;
     init_msg.set_username(username);
-    stream->Write(init_msg);
+    if (!stream->Write(init_msg)) {
+        std::cerr << "Error: could not connect to timeline - server may be down.\n";
+        return;
+    }
 
-    // set up reader thread
-    std::thread reader([&stream]() {
+    std::atomic<bool> stream_alive{true};
 
+    std::thread reader([&stream, &stream_alive]() {
         Message server_msg;
-
         while (stream->Read(&server_msg)) {
-
             std::time_t t = server_msg.timestamp().seconds();
-
-            displayPostMessage(
-                server_msg.username(),
-                server_msg.msg(),
-                t
-            );
+            displayPostMessage(server_msg.username(), server_msg.msg(), t);
         }
+        stream_alive = false;
     });
 
-    // set up writer thread
-    std::thread writer([username, &stream]() {
-
-        while (true) {
+    std::thread writer([username, &stream, &stream_alive]() {
+        while (stream_alive) {
             std::string input = getPostMessage();
+            if (!stream_alive) break;
             Message msg = MakeMessage(username, input);
-            stream->Write(msg);
+            if (!stream->Write(msg)) {
+                std::cerr << "Error: lost connection to server.\n";
+                stream_alive = false;
+                break;
+            }
         }
-
         stream->WritesDone();
     });
 
     writer.join();
     reader.join();
+
+    // return status
+    Status status = stream->Finish();
+    if (!status.ok()) {
+        std::cerr << "Timeline ended: server unavailable ("
+                  << status.error_message() << ")\n";
+    }
 }
 
-//////////////////////////////////////////////
-// Main Function
-/////////////////////////////////////////////
 int main(int argc, char** argv) {
 
-  std::string hostname = "localhost";
-  std::string username = "default";
-  std::string port = "3010";
-    
+    // new parameters for zookeeper
+    std::string zk_address = "localhost:2181";
+    std::string username   = "default";
+
   int opt = 0;
-  while ((opt = getopt(argc, argv, "h:u:p:")) != -1){
+  while ((opt = getopt(argc, argv, "h:u:")) != -1) {
     switch(opt) {
-    case 'h':
-      hostname = optarg;break;
-    case 'u':
-      username = optarg;break;
-    case 'p':
-      port = optarg;break;
+    case 'h': zk_address = optarg; break;
+    case 'u': username   = optarg; break;
     default:
-      std::cout << "Invalid Command Line Argument\n";
+      std::cerr << "Usage: " << argv[0] << " -h <zookeeper_host:port> -u <username>\n";
+      return 1;
     }
   }
-      
-  std::cout << "Logging Initialized. Client starting...";
-  
-  Client myc(hostname, username, port);
-  
+
+  Client myc(zk_address, username);
   myc.run();
-  
   return 0;
 }
